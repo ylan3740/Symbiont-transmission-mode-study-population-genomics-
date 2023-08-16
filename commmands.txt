@@ -1,0 +1,454 @@
+# Clean the Illumina reads with Trimmomatic
+java -jar trimmomatic-0.39.jar PE -phred33 input_forward.fq.gz input_reverse.fq.gz output_forward_paired.fq.gz output_forward_unpaired.fq.gz output_reverse_paired.fq.gz output_reverse_unpaired.fq.gz ILLUMINACLIP:TruSeq3-PE-2.fa:2:30:10 LEADING:3 TRAILING:3 SLIDINGWINDOW:4:15 MINLEN:36
+
+#Symbiont genome assembly pipelines
+spades.py --meta -1 osg_1.fq -2 osg_2.fq -k 61,81,101,121 -o symbiont_assemble â€“t 20
+megahit -1 WC3S2_1_paired.fq.gz -2 WC3S2_2_paired.fq.gz -m 192000000000 -t 40 --k-list 75,95,115,135 -o WC3S_megahit
+perl run_MaxBin.pl -contig osg_contig -reads osg_1_paired.fq -reads2 osg_2_paired.fq -out osg_out -thread 20
+
+##Quality check of symbiont genomes with CheckM
+checkm lineage_wf bin/ checkm_output -x fasta
+
+## Gene prediction of symbiont genome
+prokka symbiont.fasta --outdir symbiont
+
+# blast the whole NCBI nr database
+blastp -num_threads 96 -query proteins.fa -db nr_database -out Blastp.m5 -outfmt 5 -evalue 1e-5 -max_target_seqs 5 
+
+# using Salmon to quantify the gene expression
+salmon index  -t csq_sob_cds.fa -i csq_sob_cds_index
+salmon quant -i csq_sob_cds_index -l A -1 B2RNA_1_paired.fq.gz -2 B2RNA_2_paired.fq.gz -p 40 -o B2RNA_salmon_quant --validateMappings
+
+# gene expression analysis using edgeR
+perl ~/software/App/trinityrnaseq-v2.10.0/Analysis/DifferentialExpression/run_DE_analysis.pl -s Sum_9_samples_file --matrix Sum.isoform.counts.matrix --method edgeR -o Sum_9_edgeR  --dispersion 0.1
+
+# Assign the orthologue genes by Orthofinder
+python orthofinder.py -f all_protein_seq/ -t 288 -a 288 -S blast -M msa
+
+# phylogenetic analysis with iqtree
+iqtree -s ali.fasta -st AA -m LG+I+G4+F -bb 1000 -alrt 1000 -nt 4
+
+# positive selection analysis
+muscle -in orthologs/$_ -out orthologs/$_.ali.fasta
+perl ~/software/pal2nal.v14/pal2nal.pl orthologs/$_.aln.faa orthologs_cds/$_ -output fasta > orthologs_cds/$_.ali.fasta
+Gblocks orthologs_cds/$_.ali.fasta -t=c
+hyphy meme --alignment orthologs_cds/$_.ali.fasta-gb --tree ../all.aln.fasta.contree CPU=10 > orthologs_cds/$_.ali.fasta-gb_meme.txt
+hyphy fubar --alignment orthologs_cds/$_.ali.fasta-gb --tree ../all.aln.fasta.contree CPU=10 > orthologs_cds/$_.ali.fasta-gb_fubar.txt
+
+# SNP analysis
+bowtie2 -p 40 -x ../csq_genome.fasta -1 $AP1 -2 $AP2 -S bowtie2_PE.sam
+samtools view -bS bowtie2_PE.sam -o bowtie2_PE.bam
+java -jar ~/software/App/gatk-4.1.8.0/gatk-package-4.1.8.0-local.jar AddOrReplaceReadGroups -I bowtie2_PE.bam -O bowtie2_PE_addRG.bam --SORT_ORDER coordinate --RGID group1 --RGLB lib1 --RGPL illumina --RGPU uni
+t1 --RGSM "$K"
+java -jar ~/software/App/gatk-4.1.8.0/gatk-package-4.1.8.0-local.jar SortSam -I bowtie2_PE_addRG.bam -O bowtie2_PE_addRG_sorted.bam --SORT_ORDER coordinate
+samtools flagstat bowtie2_PE_sorted_addRG.bam -@ 40 >$nStat
+java -jar ~/software/App/gatk-4.1.8.0/gatk-package-4.1.8.0-local.jar MarkDuplicates -I bowtie2_PE_addRG_sorted.bam -O bowtie2_PE_addRG_sorted_dedupe.bam --METRICS_FILE bowtie2_metrics.txt
+samtools index bowtie2_PE_addRG_sorted_dedupe.bam       
+java -jar ~/software/App/gatk-4.1.8.0/gatk-package-4.1.8.0-local.jar HaplotypeCaller -R ../csq_genome.fasta -I bowtie2_PE_addRG_sorted_dedupe.bam -ploidy 10 -stand-call-conf 30 -O ./$vcfname -ERC GVCF
+java -jar ~/software/App/gatk-4.1.8.0/gatk-package-4.1.8.0-local.jar VariantFiltration -V ./$vcfname --filter-name "lowQD" --filter-expression "QD < 2.0" --filter-name "lowMQ" --filter-expression "MQ < 40.0" --filter-name "highFS" --filter-expression "FS > 60.0" --filter-name "lowMQRankSum" --filter-expression "MQRankSum < -12.5" --filter-name "ReadPosRankSum" --filter-expression "ReadPosRankSum < -8.0" --genotype-filter-name "highSOR" --genotype-filter-expression "SOR > 4.0" -O ./$K.SNP.filter.vcf
+
+cat $K.SNP.filter.vcf | grep 'PASS\|^#' > ./$K.SNP.filter.PASS.vcf
+/usr/bin/java -jar ~/software/snpEff/snpEff.jar CsqS ./$K.SNP.filter.PASS.vcf > ./$K.SNP.filter.PASS.annotate.vcf
+
+#### db-RDAs analysis (Rscript)
+---
+title: "Ordination and canonical analyses"
+output:
+  html_document: default
+  pdf_document: default
+editor_options:
+  chunk_output_type: console
+---
+# Initiate environment
+First, we specify the working directory and load all the packages we will need.
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+setwd('~/Desktop/Gaegis/')
+Sys.setenv("PATH" = paste(Sys.getenv("PATH"), "/Users/maeperez/anaconda2/envs/py36/bin/", sep = .Platform$path.sep))
+knitr::opts_chunk$set(echo = TRUE)
+require('ape')
+require('plotly')
+require('ggplot2')
+require('dplyr')
+require('reshape2')
+require('ade4')
+require('stringr')
+require('vegan')
+require("gridExtra")
+require("usedist")
+```
+
+# Import data
+Then we load and format the Fst matrix and associated metadata
+
+```{r }
+# Metadata = info about different hierarchical levels
+
+meta = read.csv('metadata.txt',header=TRUE,sep='\t')
+
+gaegis_dist = read.csv('Fst_matrix.txt',header=T,sep='\t')
+gaegis_dist %>% str # to inspect the matrix
+
+## format the matrix
+
+m2 <- diag(22)
+colnames(m2) <- rownames(m2) <- seq(1,22)
+
+
+m2[cbind(gaegis_dist$col1, gaegis_dist$col2)] <- m2[cbind(gaegis_dist$col2, gaegis_dist$col1)] <- gaegis_dist$average.Fst
+
+
+
+fst<-as.dist(as.matrix(m2)) # generate distance object
+
+fst
+
+heatmap(as.matrix(m2)) # simple representation of the distance matrix as heatmap
+plot(nj(as.matrix(m2)), "u") # simple neighbor-joining tree based on Fst distance matrix
+
+```
+
+# plot PcoA of Fst
+Here, we do an ordination plot to see how the symbiont populations cluster according to their Fst differentiation.
+
+```{R}
+#biplot(pcoa(fst)) # raw PCoA plot
+
+plot(pcoa(fst)$values$Cum_corr_eig) # Plot of the cumulative correctedn eigen values. The first 3 axes hold most of the variance (>78%). More than 60% of the variance is held in the first 2 axes (45% for the first 3 axes)
+```
+
+```{r echo=TRUE}
+dat=as.data.frame(pcoa(fst)$vectors)[,1:4]
+
+var_expl=pcoa(fst)$values$Rel_corr_eig # to get the % of variation explained by the axes
+
+dat['id']=rownames(dat)
+dat=merge(dat,meta,by.x='id',by.y="id", all.x=T)
+
+dat$ridge=factor(dat$ridge,levels=c("CR","CIR","SWIR"))
+dat$vent=factor(dat$vent,levels=c("Wocan", "Longqi", "Solitaire", "Kairei", "Tiancheng"))
+
+#### Make 2D plot ####
+
+ridge_colors=c(`CIR` = "#a63603", `SWIR` = "#006d2c", `CR` = "#08519c")
+vent_colors=c(`Wocan`="#f6c048",`Longqi`="#385492",`Solitaire`="#a5c2e3",`Kairei`="#de8244",`Tiancheng`="#a0ce63")
+
+p1<-ggplot(dat)+
+  geom_point(aes(x=Axis.1,y=Axis.2, color=vent, shape=ridge),size=3)+
+  xlab(paste('PCoA 1 (',sprintf("%0.1f%%", var_expl[1]*100),')'))+
+  ylab(paste('PCoA 2 (',sprintf("%0.1f%%", var_expl[2]*100),')'))+
+  scale_color_manual(values = vent_colors)+
+  labs(col="Vent site",shape="Ridge")+
+  theme_bw()
+
+
+p2<-ggplot(dat)+
+  geom_point(aes(x=Axis.1,y=Axis.3, color=vent, shape=ridge),size=3)+
+  xlab(paste('PCoA 1 (',sprintf("%0.1f%%", var_expl[1]*100),')'))+
+  ylab(paste('PCoA 3 (',sprintf("%0.1f%%", var_expl[3]*100),')'))+
+  scale_color_manual(values = vent_colors)+
+  theme_bw()+
+  theme(legend.position="none")
+
+
+get_legend<-function(myggplot){
+  tmp <- ggplot_gtable(ggplot_build(myggplot))
+  leg <- which(sapply(tmp$grobs, function(x) x$name) == "guide-box")
+  legend <- tmp$grobs[[leg]]
+  return(legend)
+}
+legend <- get_legend(p1)
+p1<-p1+ theme(legend.position="none")
+p3 <- grid.arrange(p1 ,p2 ,
+             legend, ncol=3,widths=c(2.3, 2.3, 1))
+
+
+```
+
+It is always nice to look at a 3D plot with the first three axes of the PCA rather than mutliple 2D plots.
+
+```{r message=FALSE, warning=FALSE}
+#### 3D plot ####
+
+fig<-plot_ly(data=dat, x =~Axis.3, y =~Axis.1, z=~Axis.2, marker = list(size = 5), color=~vent, text=paste(dat$host_ind,'\n', dat$vent,'\n',dat$ridge),colors=c(`Wocan`="#f6c048",`Longqi`="#385492",`Solitaire`="#a5c2e3",`Kairei`="#de8244",`Tiancheng`="#a0ce63")) %>%
+  add_markers() %>%
+  layout(showlegend=FALSE,
+         xaxis = list(range = c(0, 1)),
+         yaxis = list(range = c(0, 1)),
+         zaxis = list(range = c(0, 1)),
+         scene = list(xaxis = list(title = paste('PCoA 3 (',sprintf("%0.1f%%", var_expl[3]*100),')')),
+                      yaxis = list(title = paste('PCoA 1 (',sprintf("%0.1f%%", var_expl[1]*100),')')),
+                     zaxis = list(title = paste('PCoA 2 (',sprintf("%0.1f%%", var_expl[2]*100),')'))))
+
+scene = list(camera = list(eye = list(x = 1.5, y = 1.5, z = 0.75),center=list(x=0, y=-0.2, z=-0.3)))
+
+fig %>% layout(scene=scene)
+
+
+plotly::orca(fig, "PCoA2.pdf")
+
+
+```
+
+# db-RDA
+
+Now we can do distance-based canonical analyses to quantify the effect of each geographical level (mid-ocean ridge and site) of the genetic composition of the symbiont populations.The significance of each level is tested by PERMANOVAs
+
+## Perform the hierarchical db-RDA
+
+Hierarchical db-RDA is similar to AMOVA but the smallest level is at the population level (= intra-host symbiont popupaltion) rather than individual (=individual bacterial cell).
+
+The column `PropVariance` tells the proportion of the variance in the Fst matrix explained by the different hierachical levels (ridges, vent sites within ridges and individual hosts within vent sites). The column pval tells which hierachical levels are significant in explaining the variation observed between populations. There is no pval for the lowest level (individual hosts within vent sites). 
+
+In your Gaegis data, each hierarchical level explain about a third of the variance observed between populations. Both differences between ridges and between sites within ridges significantly explain affect the symbiont population structure. This means the symbiont populations are shaped locally. Note that the differences between populations may be exacerbated due to false positive and or somatic SNPs...
+
+###Testing for all hierarchical levels
+
+```{r}
+results=data.frame(level=character(), PropVariance=as.numeric(), Df=numeric(),SumofSquares=numeric(),F=numeric(),pval=numeric()) # initialize final summary table
+
+build_dbRDA_table = function(res){
+  lev1=as.character(strsplit(as.character(summary(res)$call)[2], " ")[[1]][3])
+  lev2=as.character(str_extract(as.character(summary(res)$call)[2], "(?<=\\()(.*?)(?=\\))"))
+  lev=as.character(paste(lev1,"within",lev2))
+  anova=anova.cca(res, by='terms',permu=1000)
+  df=anova$Df[1]
+  ss=anova$SumOfSqs[1]
+  F_=anova$F[1]
+  pval=anova$`Pr(>F)`[1]
+  summary(res)
+  table=as.data.frame(c(level=lev,
+          PropVariance=summary(res)$constr.chi/summary(res)$tot.chi,
+          Df=df,
+          SumofSquares=ss,
+          F=F_,
+          pval=pval)) %>% t(.)
+  rownames(table)=''
+  return(table)
+} # load db-RDA summary table building function
+
+## Proportion of variance explained by differences between ridges
+res=capscale(fst~ridge,meta)
+lev=strsplit(as.character(summary(res)$call)[2],'~ ')[[1]][2]
+anova=anova.cca(res, by='terms',permu=1000)
+df=anova$Df[1]
+ss=anova$SumOfSqs[1]
+F_=anova$F[1]
+pval=anova$`Pr(>F)`[1]
+table=as.data.frame(c(level=lev,
+        PropVariance=summary(res)$constr.chi/summary(res)$tot.chi,
+        Df=df,
+        SumofSquares=ss,
+        F=F_,
+        pval=pval)) %>% t(.)
+rownames(table)=''
+results=rbind(results,table)
+
+
+## Proportion of variance explained by differences between vent site within ridges
+
+res=capscale(fst~vent+Condition(ridge),meta)
+table=build_dbRDA_table(res)
+results=rbind(results,table)
+
+
+## Proportion of variance explained by differences between individual hosts within vent sites
+
+res=capscale(fst~host_ind+Condition(vent)+Condition(ridge),meta)
+table=build_dbRDA_table(res)
+results=rbind(results,table)
+
+## Total
+results$PropVariance <- as.numeric(as.character(results$PropVariance))
+results$Df <- as.numeric(as.character(results$Df))
+results$SumofSquares <- as.numeric(as.character(results$SumofSquares))
+results$F <- as.numeric(as.character(results$F))
+results$pval <- as.numeric(as.character(results$pval))
+
+lev='Total'
+df=NA
+ss=NA
+F_=NA
+pval=NA
+table=as.data.frame(c(level=lev,
+        PropVariance=sum(results$PropVariance),
+        Df=df,
+        SumofSquares=ss,
+        F=F_,
+        pval=pval)) %>% t(.)
+rownames(table)=''
+results=rbind(results,table)
+
+### Final table showing all hierarchical levels
+
+results
+
+write.table(results,'hierarchical_db-RDA.txt',col.names=T,sep='\t', quote=F,row.names=F)
+
+```
+
+### Testing for the vents overall (unconstrained analysis)
+
+```{r message=FALSE, warning=FALSE}
+results=data.frame(level=character(), PropVariance=as.numeric(), Df=numeric(),SumofSquares=numeric(),F=numeric(),pval=numeric()) # initialize final summary table
+
+res=capscale(fst~vent,meta)
+lev=strsplit(as.character(summary(res)$call)[2],'~ ')[[1]][2]
+anova=anova.cca(res, by='terms',permu=1000)
+df=anova$Df[1]
+ss=anova$SumOfSqs[1]
+F_=anova$F[1]
+pval=anova$`Pr(>F)`[1]
+table=as.data.frame(c(level=lev,
+        PropVariance=summary(res)$constr.chi/summary(res)$tot.chi,
+        Df=df,
+        SumofSquares=ss,
+        F=F_,
+        pval=pval)) %>% t(.)
+rownames(table)=''
+results=rbind(results,table)
+
+results
+```
+
+### Testing all levels but excluding samples from Carlsberg Ridge
+
+```{r message=FALSE, warning=FALSE}
+
+results=data.frame(level=character(), PropVariance=as.numeric(), Df=numeric(),SumofSquares=numeric(),F=numeric(),pval=numeric()) # initialize final summary table
+
+fst_noCR=dist_subset(fst,seq(1,19))
+meta_noCR=subset(meta, ridge != "CR")
+
+build_dbRDA_table = function(res){
+  lev1=as.character(strsplit(as.character(summary(res)$call)[2], " ")[[1]][3])
+  lev2=as.character(str_extract(as.character(summary(res)$call)[2], "(?<=\\()(.*?)(?=\\))"))
+  lev=as.character(paste(lev1,"within",lev2))
+  anova=anova.cca(res, by='terms',permu=1000)
+  df=anova$Df[1]
+  ss=anova$SumOfSqs[1]
+  F_=anova$F[1]
+  pval=anova$`Pr(>F)`[1]
+  summary(res)
+  table=as.data.frame(c(level=lev,
+          PropVariance=summary(res)$constr.chi/summary(res)$tot.chi,
+          Df=df,
+          SumofSquares=ss,
+          F=F_,
+          pval=pval)) %>% t(.)
+  rownames(table)=''
+  return(table)
+} # load db-RDA summary table building function
+
+## Proportion of variance explained by differences between ridges
+res=capscale(fst_noCR~ridge,meta_noCR)
+lev=strsplit(as.character(summary(res)$call)[2],'~ ')[[1]][2]
+anova=anova.cca(res, by='terms',permu=1000)
+df=anova$Df[1]
+ss=anova$SumOfSqs[1]
+F_=anova$F[1]
+pval=anova$`Pr(>F)`[1]
+table=as.data.frame(c(level=lev,
+        PropVariance=summary(res)$constr.chi/summary(res)$tot.chi,
+        Df=df,
+        SumofSquares=ss,
+        F=F_,
+        pval=pval)) %>% t(.)
+rownames(table)=''
+
+results=rbind(results,table)
+
+
+## Proportion of variance explained by differences between vent site within ridges
+
+res=capscale(fst_noCR~vent+Condition(ridge),meta_noCR)
+
+table=build_dbRDA_table(res)
+results=rbind(results,table)
+
+
+## Proportion of variance explained by differences between individual hosts within vent sites
+
+res=capscale(fst_noCR~host_ind+Condition(vent)+Condition(ridge),meta_noCR)
+table=build_dbRDA_table(res)
+results=rbind(results,table)
+
+## Total
+results$PropVariance <- as.numeric(as.character(results$PropVariance))
+results$Df <- as.numeric(as.character(results$Df))
+results$SumofSquares <- as.numeric(as.character(results$SumofSquares))
+results$F <- as.numeric(as.character(results$F))
+results$pval <- as.numeric(as.character(results$pval))
+
+lev='Total'
+df=NA
+ss=NA
+F_=NA
+pval=NA
+table=as.data.frame(c(level=lev,
+        PropVariance=sum(results$PropVariance),
+        Df=df,
+        SumofSquares=ss,
+        F=F_,
+        pval=pval)) %>% t(.)
+rownames(table)=''
+results=rbind(results,table)
+
+### Final table showing all hierarchical levels
+
+results
+```
+
+## Plot the db-RDAs
+
+### Load the dbrda function plotting
+
+First, we need to edit the row names on the metadata tables to match these of the Fst matrix. Then we load a function that will generate plots that show how your populations cluster together according to specific hierarchical levels (ridges or vent sites). 
+
+```{r}
+rownames(meta)=meta$id
+meta=meta[,c('host_ind','vent','ridge')]
+
+ridge_colors=c(`CIR` = "#a63603", `SWIR` = "#006d2c", `CR` = "#08519c")
+
+vent_colors=c(`Wocan`="#f6c048",`Longqi`="#385492",`Solitaire`="#a5c2e3",`Kairei`="#de8244",`Tiancheng`="#a0ce63")
+
+plot_dbrda=function(res,meta,level,level_colors=level_colors){
+  # require("ggConvexHull")
+
+  s=res %>% summary()
+  s2=merge(as.data.frame(s$sites),meta,by.x=0,by.y=0,all.x=T)
+  var_expl=c(s$cont$importance[2,c(1,2)])
+
+  plot=ggplot(data=s2)+
+    geom_point(aes_string(x='CAP1',y='CAP2',color=level),alpha=0.8,size=2)+
+    scale_fill_manual(values = level_colors)+
+    scale_color_manual(values = level_colors)+
+    # geom_convexhull(alpha=.5,aes(x=CAP1,y=CAP2,fill=Site))+
+    xlab(paste(names(var_expl)[1],sprintf("%0.1f%%", var_expl[1]*100)))+
+    ylab(paste(names(var_expl)[2],sprintf("%0.1f%%", var_expl[2]*100)))
+  
+  return(plot)
+}
+
+```
+
+### 2D plot: vent sites
+2D plot showing most variance between samples according to ridges
+
+```{r}
+
+res=capscale(fst~ridge,meta)
+plot_dbrda(res,meta,"ridge",level_colors=ridge_colors)+
+  theme_bw()
+```
+
+
+2D plot showing most variance between samples according to vent sites
+
+```{r}
+
+res=capscale(fst~vent,meta)
+plot_dbrda(res,meta,'vent',level_colors=vent_colors)+
+  theme_bw()
+```
