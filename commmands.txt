@@ -2,7 +2,7 @@
 java -jar trimmomatic-0.39.jar PE -phred33 input_forward.fq.gz input_reverse.fq.gz output_forward_paired.fq.gz output_forward_unpaired.fq.gz output_reverse_paired.fq.gz output_reverse_unpaired.fq.gz ILLUMINACLIP:TruSeq3-PE-2.fa:2:30:10 LEADING:3 TRAILING:3 SLIDINGWINDOW:4:15 MINLEN:36
 
 #Symbiont genome assembly pipelines
-spades.py --meta -1 osg_1.fq -2 osg_2.fq -k 61,81,101,121 -o symbiont_assemble â€“t 20
+spades.py --meta -1 osg_1.fq -2 osg_2.fq -k 61,81,101,121 -o symbiont_assemble -t 20
 megahit -1 WC3S2_1_paired.fq.gz -2 WC3S2_2_paired.fq.gz -m 192000000000 -t 40 --k-list 75,95,115,135 -o WC3S_megahit
 perl run_MaxBin.pl -contig osg_contig -reads osg_1_paired.fq -reads2 osg_2_paired.fq -out osg_out -thread 20
 
